@@ -198,9 +198,11 @@ class ClipTimeDialog(QDialog):
 # ---------------------------------------------------------------- главное окно
 
 class MainWindow(QMainWindow):
-    HELP = ("Space — играть/пауза   ←/→ — ±5с   ,/. — кадр   "
+    HELP = ("Space — играть/пауза   ←/→ — ±5с   ,/. — кадр   PgUp/PgDn — пред./след. видео   "
             "Q — убрать слева   W — убрать справа   E — рассечь   Del — удалить сегмент   "
             "/ — кадр в фото   Ctrl+Z — отмена")
+    HELP_QUICK = ("⚡ Быстрый режим: только фото.   / — кадр в фото   Space — играть/пауза   "
+                  "←/→ — ±5с   ,/. — кадр   PgUp/PgDn — пред./след. видео")
 
     def __init__(self):
         super().__init__()
@@ -214,6 +216,8 @@ class MainWindow(QMainWindow):
         self.notifier = _Notifier()
         self.notifier.done.connect(self._bg_done)
         self._kf_pending: set[str] = set()
+        self._gps_pending: set[str] = set()
+        self.quick_mode = False
 
         # --- виджеты
         central = QWidget(); self.setCentralWidget(central)
@@ -221,12 +225,21 @@ class MainWindow(QMainWindow):
 
         top = QHBoxLayout()
         for text, slot in [("➕ Видео", self.add_videos),
+                           ("⚡ Папка → фото", self.open_quick_folder),
                            ("🗺 Трек (GPX)", self.load_track),
                            ("🎬 Скомпилировать", self.compile_video),
                            ("⚙ Настройки", self.open_settings)]:
             b = QPushButton(text); b.clicked.connect(slot)
             b.setFocusPolicy(Qt.NoFocus)
             top.addWidget(b)
+        self.full_btn = QPushButton("✏ В полный редактор")
+        self.full_btn.setFocusPolicy(Qt.NoFocus)
+        self.full_btn.clicked.connect(self.to_full_editor)
+        self.full_btn.setVisible(False)
+        top.addWidget(self.full_btn)
+        self.mode_lbl = QLabel("")
+        self.mode_lbl.setStyleSheet("color:#6ac06a; font-weight:bold;")
+        top.addWidget(self.mode_lbl)
         self.track_lbl = QLabel("трек не загружен")
         self.track_lbl.setStyleSheet("color:#888;")
         top.addWidget(self.track_lbl)
@@ -257,9 +270,9 @@ class MainWindow(QMainWindow):
         self.timeline.seek_requested.connect(self.seek_global)
         v.addWidget(self.timeline)
 
-        hint = QLabel(self.HELP)
-        hint.setStyleSheet("color:#777; font-size:11px;")
-        v.addWidget(hint)
+        self.hint = QLabel(self.HELP)
+        self.hint.setStyleSheet("color:#777; font-size:11px;")
+        v.addWidget(self.hint)
 
         self.setStatusBar(QStatusBar())
         self.setAcceptDrops(True)
@@ -279,6 +292,8 @@ class MainWindow(QMainWindow):
         key(Qt.Key_Right, lambda: self.seek_global(self.cur_global + 5))
         key(Qt.Key_Comma, lambda: self._frame(back=True))
         key(Qt.Key_Period, lambda: self._frame(back=False))
+        key(Qt.Key_PageDown, lambda: self.jump_clip(1))
+        key(Qt.Key_PageUp, lambda: self.jump_clip(-1))
         key(QKeySequence.Undo, self._undo)
 
         self._suppress_time = False
@@ -307,27 +322,118 @@ class MainWindow(QMainWindow):
             self._add_clip_paths(paths)
 
     def _add_clip_paths(self, paths: list[str]):
-        for path in paths:
+        prog = None
+        if len(paths) > 3:
+            prog = QProgressDialog("Читаю видео…", None, 0, len(paths), self)
+            prog.setWindowTitle("TripCut"); prog.setWindowModality(Qt.WindowModal)
+            prog.setMinimumDuration(0); prog.setCancelButton(None)
+        errors = []
+        for k, path in enumerate(paths):
+            if prog:
+                prog.setValue(k); prog.setLabelText(os.path.basename(path))
+                QApplication.processEvents()
             try:
                 info = ft.probe(path)
             except Exception as e:                  # noqa: BLE001
-                QMessageBox.warning(self, "TripCut", f"Не открылось:\n{path}\n\n{e}")
+                errors.append(f"{os.path.basename(path)}: {e}")
                 continue
             clip = M.Clip(info=info, start_dt=info.creation_time)
             self.project.add_clip(clip)
             item = QListWidgetItem(self._clip_label(clip))
             item.setData(Qt.UserRole, clip)
             self.clip_list.addItem(item)
-            # фоновая индексация ключевых кадров + GPS камеры
-            self._kf_pending.add(path)
-            _bg(self.notifier, f"kf|{path}", lambda p=path: ft.keyframes(p))
-            if info.gpmd_stream is not None:
-                _bg(self.notifier, f"gps|{path}",
-                    lambda p=path, s=info.gpmd_stream: gopro_track(p, s))
+            if not self.quick_mode:
+                # редактор: сразу индексируем ключевые кадры + GPS камеры
+                self._start_kf(clip)
+                self._start_gps(clip)
+        if prog:
+            prog.setValue(len(paths))
+        if errors:
+            QMessageBox.warning(self, "TripCut", "Не открылись:\n" + "\n".join(errors[:10]))
         self.timeline.update()
         if self.player.current_path is None and self.project.segments:
             self.seek_global(0.0)
         self._update_status()
+
+    def _start_kf(self, clip: M.Clip):
+        if clip.keyframes or clip.path in self._kf_pending:
+            return
+        self._kf_pending.add(clip.path)
+        _bg(self.notifier, f"kf|{clip.path}", lambda p=clip.path: ft.keyframes(p))
+
+    def _start_gps(self, clip: M.Clip):
+        """GPS камеры; в быстром режиме зовётся лениво — при заходе курсора в клип."""
+        if clip.info.gpmd_stream is None or clip.own_track is not None \
+                or clip.path in self._gps_pending:
+            return
+        self._gps_pending.add(clip.path)
+        _bg(self.notifier, f"gps|{clip.path}",
+            lambda p=clip.path, s=clip.info.gpmd_stream: gopro_track(p, s))
+
+    # ---------------- быстрый режим (папка → фото)
+    def open_quick_folder(self):
+        d = QFileDialog.getExistingDirectory(self, "Папка с видео")
+        if not d:
+            return
+        files = sorted(
+            os.path.join(d, f) for f in os.listdir(d)
+            if f.lower().endswith(VIDEO_EXT) and not f.lower().endswith(".lrv"))
+        if not files:
+            QMessageBox.information(self, "TripCut", "В папке нет видеофайлов")
+            return
+        if self.project.segments and QMessageBox.question(
+                self, "TripCut", "Закрыть текущий проект и открыть папку?") != QMessageBox.Yes:
+            return
+        self._reset_project()
+        self.quick_mode = True
+        self._update_mode_ui()
+        self._add_clip_paths(files)
+        self.statusBar().showMessage(
+            f"⚡ Быстрый режим: {len(files)} видео из {d}. «/» — фото, PgDn — следующее видео",
+            10000)
+
+    def to_full_editor(self):
+        self.quick_mode = False
+        self._update_mode_ui()
+        for clip in self.project.clips:      # доиндексировать для нарезки
+            self._start_kf(clip)
+            self._start_gps(clip)
+        self._update_status()
+
+    def _update_mode_ui(self):
+        self.full_btn.setVisible(self.quick_mode)
+        self.mode_lbl.setText("⚡ БЫСТРЫЙ РЕЖИМ" if self.quick_mode else "")
+        self.hint.setText(self.HELP_QUICK if self.quick_mode else self.HELP)
+
+    def _reset_project(self):
+        self.player.set_paused(True)
+        self.project.clips.clear()
+        self.project.segments.clear()
+        self.project._undo.clear()
+        self.clip_list.clear()
+        self.cur_global = 0.0
+        self.active_idx = 0
+        self.timeline.update()
+
+    def jump_clip(self, delta: int):
+        """PgUp/PgDn: к началу предыдущего/следующего видео на таймлайне."""
+        if not self.project.segments:
+            return
+        starts, acc, cur = [], 0.0, None
+        for s in self.project.segments:
+            if s.clip is not cur:
+                starts.append(acc)
+                cur = s.clip
+            acc += s.duration
+        i = max((j for j, st in enumerate(starts) if st <= self.cur_global + 1e-3),
+                default=0)
+        tgt = i + delta
+        if 0 <= tgt < len(starts):
+            self.seek_global(starts[tgt] + 0.001)
+            loc = self.project.locate(self.cur_global)
+            if loc:
+                self.statusBar().showMessage(
+                    f"видео {tgt + 1}/{len(starts)}: {loc[0].clip.name}", 4000)
 
     def _clip_label(self, clip: M.Clip) -> str:
         dt = clip.start_dt.strftime("%d.%m %H:%M:%S") if clip.start_dt else "⚠ нет времени"
@@ -350,6 +456,7 @@ class MainWindow(QMainWindow):
         if isinstance(result, Exception):
             self.statusBar().showMessage(f"Ошибка ({kind}): {result}", 8000)
             self._kf_pending.discard(path)
+            self._gps_pending.discard(path)
             return
         for clip in self.project.clips:
             if clip.path != path:
@@ -361,9 +468,10 @@ class MainWindow(QMainWindow):
                     f"{clip.name}: {len(result)} ключевых кадров", 4000)
             elif kind == "gps":
                 clip.own_track = result
-                n = len(result)
+                self._gps_pending.discard(path)
                 self.statusBar().showMessage(
-                    f"{clip.name}: GPS-точек в файле: {n}", 6000)
+                    f"{clip.name}: GPS-точек в файле: {len(result)}", 6000)
+                self._update_geo_label()
             elif kind == "photo":
                 self.statusBar().showMessage(f"📸 {result}", 6000)
             elif kind == "compile":
@@ -399,6 +507,8 @@ class MainWindow(QMainWindow):
         seg, src_t, i = loc
         self.cur_global = self.project.global_of(i, src_t)
         self.active_idx = i
+        if self.quick_mode:
+            self._start_gps(seg.clip)   # ленивый парс GPS при заходе в клип
         self._suppress_time = True
         if self.player.current_path != seg.clip.path:
             self.player.load(seg.clip.path, start=src_t)
@@ -444,6 +554,10 @@ class MainWindow(QMainWindow):
     # ---------------- операции резки
     def _edit_op(self, op: str):
         if not self.project.segments:
+            return
+        if self.quick_mode:
+            self.statusBar().showMessage(
+                "⚡ Быстрый режим — только фото. Кнопка «В полный редактор» включит нарезку", 5000)
             return
         was = self.cur_global
         ok = {"q": self.project.trim_left, "w": self.project.trim_right,
@@ -491,7 +605,8 @@ class MainWindow(QMainWindow):
         dt = M.capture_datetime(clip, src_t)
         cfg = self.st.geo()
         p = M.resolve_location(clip, src_t, self.track, cfg)
-        parts = [f"📅 {dt:%d.%m.%Y %H:%M:%S}" if dt else "⚠ нет времени старта клипа"]
+        parts = [f"🎞 {clip.name}",
+                 f"📅 {dt:%d.%m.%Y %H:%M:%S}" if dt else "⚠ нет времени старта клипа"]
         if p:
             parts.append(f"📍 {p.lat:.6f}, {p.lon:.6f}")
         elif cfg.mode != "none":
@@ -529,6 +644,11 @@ class MainWindow(QMainWindow):
     def compile_video(self):
         if not self.project.segments:
             QMessageBox.information(self, "TripCut", "Сначала добавьте видео")
+            return
+        if self.quick_mode:
+            QMessageBox.information(
+                self, "TripCut",
+                "Быстрый режим — только фото.\nНажми «В полный редактор», чтобы нарезать видео.")
             return
         if self._kf_pending and not self.st.smart_cut:
             QMessageBox.information(self, "TripCut",
