@@ -8,7 +8,7 @@ import re
 import subprocess
 import sys
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 # На Windows кладём ffmpeg.exe/ffprobe.exe рядом с программой (папка bin/)
@@ -45,12 +45,13 @@ class ClipInfo:
     profile: str
     acodec: str | None
     sample_rate: int | None
-    creation_time: datetime | None      # как записала камера (наивное локальное время)
+    creation_time: datetime | None      # локальное время камеры (наивное), см. probe()
     gpmd_stream: int | None             # индекс потока GoPro-телеметрии, если есть
     color: dict = field(default_factory=dict)
 
 
-def probe(path: str) -> ClipInfo:
+def probe(path: str, utc_offset_h: float = 0.0) -> ClipInfo:
+    """utc_offset_h — часовой пояс камеры: creation_time из контейнера приводится к нему."""
     p = _run([FFPROBE, "-v", "error", "-print_format", "json",
               "-show_format", "-show_streams", path])
     if p.returncode != 0:
@@ -69,10 +70,16 @@ def probe(path: str) -> ClipInfo:
           (data["format"].get("tags") or {}).get("creation_time")
     if raw:
         try:
-            # камера пишет своё выставленное время; трактуем как локальное, зону отбрасываем
-            ct = datetime.fromisoformat(raw.replace("Z", "+00:00")).replace(tzinfo=None)
+            dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
         except ValueError:
             pass
+        else:
+            # MP4 хранит creation_time в UTC (DJI/GoPro пишут с "Z") — переводим в пояс
+            # камеры. Если зоны нет, камера уже записала своё локальное время.
+            if dt.tzinfo is not None:
+                dt = (dt.astimezone(timezone.utc).replace(tzinfo=None)
+                      + timedelta(hours=utc_offset_h))
+            ct = dt
 
     color = {k: v[k] for k in ("color_space", "color_transfer", "color_primaries", "color_range")
              if v.get(k)}
