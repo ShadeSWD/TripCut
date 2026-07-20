@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+venv/
+dist/
+build/
+*.spec
+win_deps/
+bin/
+*.zip
+*.7z
+icon_256.png
