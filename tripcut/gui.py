@@ -249,6 +249,7 @@ class MainWindow(QMainWindow):
         split = QSplitter(Qt.Horizontal)
         self.player = PlayerWidget()
         self.player.time_changed.connect(self._on_time)
+        self.player.reached_eof.connect(self._on_eof)
         split.addWidget(self.player)
 
         right = QWidget(); rv = QVBoxLayout(right); rv.setContentsMargins(0, 0, 0, 0)
@@ -322,6 +323,7 @@ class MainWindow(QMainWindow):
             self._add_clip_paths(paths)
 
     def _add_clip_paths(self, paths: list[str]):
+        utc_offset_h = self.st.geo().utc_offset_h
         prog = None
         if len(paths) > 3:
             prog = QProgressDialog("Читаю видео…", None, 0, len(paths), self)
@@ -333,7 +335,7 @@ class MainWindow(QMainWindow):
                 prog.setValue(k); prog.setLabelText(os.path.basename(path))
                 QApplication.processEvents()
             try:
-                info = ft.probe(path)
+                info = ft.probe(path, utc_offset_h)
             except Exception as e:                  # noqa: BLE001
                 errors.append(f"{os.path.basename(path)}: {e}")
                 continue
@@ -527,21 +529,40 @@ class MainWindow(QMainWindow):
             return
         # выскочили за конец сегмента при воспроизведении -> прыжок дальше
         if src_t > seg.end + 0.05 and not self.player.paused:
-            if i + 1 < len(self.project.segments):
-                nxt = self.project.segments[i + 1]
-                self.active_idx = i + 1
-                self._suppress_time = True
-                if self.player.current_path != nxt.clip.path:
-                    self.player.load(nxt.clip.path, start=nxt.start)
-                    self.player.set_paused(False)
-                else:
-                    self.player.seek(nxt.start)
-                QTimer.singleShot(150, lambda: setattr(self, "_suppress_time", False))
+            if self._advance_to(i + 1):
                 return
-            self.player.set_paused(True)
         self.cur_global = self.project.global_of(i, src_t)
         self.timeline.set_cursor(self.cur_global)
         self._update_geo_label()
+
+    def _on_eof(self):
+        """mpv (keep_open=yes) замирает в конце файла: time-pos дальше не растёт и
+        _on_time не сработает — сегмент до самого конца клипа доигрывает сюда."""
+        if not self.project.segments or self.player.current_path is None:
+            return
+        i = min(self.active_idx, len(self.project.segments) - 1)
+        self._advance_to(i + 1)
+
+    def _advance_to(self, i: int) -> bool:
+        """Перейти на сегмент i, продолжая воспроизведение. False — сегменты кончились."""
+        if i >= len(self.project.segments):
+            self.player.set_paused(True)
+            return False
+        nxt = self.project.segments[i]
+        self.active_idx = i
+        self._suppress_time = True
+        if self.player.current_path != nxt.clip.path:
+            self.player.load(nxt.clip.path, start=nxt.start)
+            self.player.set_paused(False)
+        else:
+            self.player.seek(nxt.start)
+        if self.quick_mode:
+            self._start_gps(nxt.clip)   # ленивый парс GPS при заходе в клип
+        QTimer.singleShot(150, lambda: setattr(self, "_suppress_time", False))
+        self.cur_global = self.project.global_of(i, nxt.start)
+        self.timeline.set_cursor(self.cur_global)
+        self._update_geo_label()
+        return True
 
     def _play_pause(self):
         if self.player.current_path:
