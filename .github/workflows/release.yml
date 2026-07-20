@@ -1,0 +1,63 @@
+name: Build Windows release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: pip install -r requirements.txt pyinstaller
+
+      - name: Fetch ffmpeg
+        shell: pwsh
+        run: |
+          Invoke-WebRequest "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip" -OutFile ffmpeg.zip
+          7z e -y ffmpeg.zip -obin "*/bin/ffmpeg.exe" "*/bin/ffprobe.exe" -r
+
+      - name: Fetch libmpv
+        shell: pwsh
+        run: |
+          $rel = Invoke-RestMethod "https://api.github.com/repos/shinchiro/mpv-winbuild-cmake/releases/latest"
+          $asset = $rel.assets | Where-Object { $_.name -match "^mpv-dev-x86_64-[0-9]" } | Select-Object -First 1
+          if (-not $asset) { throw "libmpv asset not found" }
+          Invoke-WebRequest $asset.browser_download_url -OutFile libmpv.7z
+          7z e -y libmpv.7z -obin libmpv-2.dll
+
+      - name: Build
+        shell: pwsh
+        run: |
+          pyinstaller --noconfirm --clean --windowed --name TripCut `
+            --icon tripcut.ico --add-binary "bin\*;bin" --add-data "tripcut.ico;." main.py
+          if (-not (Test-Path dist\TripCut\TripCut.exe)) { throw "no exe" }
+
+      - name: Zip
+        shell: pwsh
+        run: Compress-Archive -Path dist\TripCut -DestinationPath TripCut-windows-x64.zip
+
+      - name: Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: TripCut-windows-x64.zip
+          body: |
+            TripCut для Windows. Распаковать ZIP, запустить `TripCut\TripCut.exe`.
+            Внутри всё нужное (ffmpeg, mpv) — установка не требуется.
+
+      - name: Upload artifact (manual run)
+        if: "!startsWith(github.ref, 'refs/tags/')"
+        uses: actions/upload-artifact@v4
+        with:
+          name: TripCut-windows-x64
+          path: TripCut-windows-x64.zip
