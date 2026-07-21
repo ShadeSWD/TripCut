@@ -47,13 +47,24 @@ class Project:
     def __init__(self):
         self.clips: list[Clip] = []
         self.segments: list[Segment] = []
-        self._undo: list[list[Segment]] = []
+        self._undo: list[tuple[list[Clip], list[Segment]]] = []
 
     # ---------------- clips
     def add_clip(self, clip: Clip):
-        self.clips.append(clip)
         self._push_undo()
+        self.clips.append(clip)
         self.segments.append(Segment(clip, 0.0, clip.info.duration))
+
+    def remove_clips(self, clips: list[Clip]) -> list[Clip]:
+        """Убрать клипы целиком — и их самих, и все их сегменты. Одна отмена на всю пачку."""
+        drop = [c for c in clips if c in self.clips]
+        if not drop:
+            return []
+        self._push_undo()
+        for c in drop:
+            self.clips.remove(c)
+        self.segments = [s for s in self.segments if s.clip not in drop]
+        return drop
 
     @property
     def total(self) -> float:
@@ -77,14 +88,16 @@ class Project:
 
     # ---------------- операции
     def _push_undo(self):
-        self._undo.append([Segment(s.clip, s.start, s.end) for s in self.segments])
+        # клипы тоже, иначе отмена удаления клипа вернула бы его сегменты без него самого
+        self._undo.append((list(self.clips),
+                           [Segment(s.clip, s.start, s.end) for s in self.segments]))
         if len(self._undo) > 100:
             self._undo.pop(0)
 
     def undo(self) -> bool:
         if not self._undo:
             return False
-        self.segments = self._undo.pop()
+        self.clips, self.segments = self._undo.pop()
         return True
 
     def trim_left(self, gt: float) -> bool:

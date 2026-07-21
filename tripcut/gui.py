@@ -12,7 +12,7 @@ from PySide6.QtGui import QAction, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QApplication, QComboBox, QCheckBox, QDateTimeEdit, QDialog, QDialogButtonBox,
     QDoubleSpinBox, QFileDialog, QFormLayout, QHBoxLayout, QLabel, QLineEdit,
-    QListWidget, QListWidgetItem, QMainWindow, QMessageBox, QProgressDialog,
+    QListWidget, QListWidgetItem, QMainWindow, QMenu, QMessageBox, QProgressDialog,
     QPushButton, QSplitter, QVBoxLayout, QWidget, QStatusBar,
 )
 
@@ -199,10 +199,11 @@ class ClipTimeDialog(QDialog):
 
 class MainWindow(QMainWindow):
     HELP = ("Space — играть/пауза   ←/→ — ±5с   ,/. — кадр   PgUp/PgDn — пред./след. видео   "
-            "Q — убрать слева   W — убрать справа   E — рассечь   Del — удалить сегмент   "
-            "/ — кадр в фото   Ctrl+Z — отмена")
+            "Q — убрать слева   W — убрать справа   E — рассечь   Del — удалить сегмент "
+            "(в списке клипов — клип)   / — кадр в фото   Ctrl+Z — отмена")
     HELP_QUICK = ("⚡ Быстрый режим: только фото.   / — кадр в фото   Space — играть/пауза   "
-                  "←/→ — ±5с   ,/. — кадр   PgUp/PgDn — пред./след. видео")
+                  "←/→ — ±5с   ,/. — кадр   PgUp/PgDn — пред./след. видео   "
+                  "Del в списке клипов — убрать клип")
 
     def __init__(self):
         super().__init__()
@@ -255,7 +256,10 @@ class MainWindow(QMainWindow):
         right = QWidget(); rv = QVBoxLayout(right); rv.setContentsMargins(0, 0, 0, 0)
         rv.addWidget(QLabel("Клипы (двойной клик — время старта):"))
         self.clip_list = QListWidget()
-        self.clip_list.setFocusPolicy(Qt.NoFocus)
+        self.clip_list.setFocusPolicy(Qt.ClickFocus)   # Del по выбранному клипу
+        self.clip_list.setSelectionMode(QListWidget.ExtendedSelection)
+        self.clip_list.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.clip_list.customContextMenuRequested.connect(self._clip_menu)
         self.clip_list.itemDoubleClicked.connect(self._edit_clip_time)
         rv.addWidget(self.clip_list)
         right.setMaximumWidth(320)
@@ -287,7 +291,7 @@ class MainWindow(QMainWindow):
         key(Qt.Key_Q, lambda: self._edit_op("q"))
         key(Qt.Key_W, lambda: self._edit_op("w"))
         key(Qt.Key_E, lambda: self._edit_op("e"))
-        key(Qt.Key_Delete, lambda: self._edit_op("del"))
+        key(Qt.Key_Delete, self._on_delete)
         key(Qt.Key_Slash, self.snap_photo)
         key(Qt.Key_Left, lambda: self.seek_global(self.cur_global - 5))
         key(Qt.Key_Right, lambda: self.seek_global(self.cur_global + 5))
@@ -447,6 +451,56 @@ class MainWindow(QMainWindow):
             it = self.clip_list.item(i)
             it.setText(self._clip_label(it.data(Qt.UserRole)))
 
+    def _rebuild_clip_list(self):
+        """Пересобрать панель из project.clips (после удаления клипа и после отмены)."""
+        self.clip_list.clear()
+        for clip in self.project.clips:
+            item = QListWidgetItem(self._clip_label(clip))
+            item.setData(Qt.UserRole, clip)
+            self.clip_list.addItem(item)
+
+    def _clip_menu(self, pos):
+        item = self.clip_list.itemAt(pos)
+        if item is None:
+            return
+        menu = QMenu(self)
+        act_time = menu.addAction("Время старта…")
+        act_del = menu.addAction("Удалить клип (Del)")
+        chosen = menu.exec(self.clip_list.mapToGlobal(pos))
+        if chosen is act_del:
+            self._remove_selected_clips()
+        elif chosen is act_time:
+            self._edit_clip_time(item)
+
+    def _on_delete(self):
+        """Del: в панели клипов удаляет клип, иначе — сегмент под курсором."""
+        if self.clip_list.hasFocus() and self.clip_list.selectedItems():
+            self._remove_selected_clips()
+        else:
+            self._edit_op("del")
+
+    def _remove_selected_clips(self):
+        clips = [it.data(Qt.UserRole) for it in self.clip_list.selectedItems()]
+        if not clips:
+            return
+        was = self.cur_global
+        removed = self.project.remove_clips(clips)
+        if not removed:
+            return
+        self._rebuild_clip_list()
+        self.active_idx = 0
+        if self.project.segments:
+            self.seek_global(min(was, self.project.total))
+        else:                                   # ничего не осталось
+            self.player.set_paused(True)
+            self.cur_global = 0.0
+            self.timeline.set_cursor(0.0)
+        self.timeline.update()
+        self._update_status()
+        names = ", ".join(c.name for c in removed)
+        self.statusBar().showMessage(
+            f"Удалено клипов: {len(removed)} ({names}) · Ctrl+Z вернёт", 5000)
+
     def _edit_clip_time(self, item: QListWidgetItem):
         clip = item.data(Qt.UserRole)
         if ClipTimeDialog(clip, self).exec():
@@ -600,8 +654,11 @@ class MainWindow(QMainWindow):
 
     def _undo(self):
         if self.project.undo():
+            self._rebuild_clip_list()       # отмена могла вернуть удалённый клип
+            self.active_idx = 0
             self.timeline.update()
             self.seek_global(min(self.cur_global, self.project.total))
+            self._update_status()
             self.statusBar().showMessage("Отменено", 2000)
 
     # ---------------- гео/дата подпись
