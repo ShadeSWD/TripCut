@@ -96,6 +96,49 @@ def probe(path: str, utc_offset_h: float = 0.0) -> ClipInfo:
     )
 
 
+@dataclass(frozen=True)
+class Format:
+    """Параметры, которые обязаны совпадать у частей, чтобы их можно было
+    склеить без перекодирования (concat demuxer + -c copy)."""
+    width: int
+    height: int
+    fps: float
+    vcodec: str
+    pix_fmt: str
+    acodec: str | None
+    sample_rate: int | None
+
+    def __str__(self) -> str:
+        a = f"{self.acodec} {self.sample_rate}Hz" if self.acodec else "без звука"
+        return f"{self.width}x{self.height} {self.fps:g}fps {self.vcodec} · {a}"
+
+
+def format_of(info: ClipInfo) -> Format:
+    return Format(width=info.width, height=info.height, fps=round(info.fps, 3),
+                  vcodec=info.vcodec, pix_fmt=info.pix_fmt,
+                  acodec=info.acodec, sample_rate=info.sample_rate)
+
+
+def same_format(info: ClipInfo, target: Format) -> bool:
+    return format_of(info) == target
+
+
+def choose_target(items: list[tuple[ClipInfo, float]]) -> Format:
+    """Целевой формат сборки: тот, которым снята наибольшая часть монтажа
+    (по суммарной длительности). Остальное приводится к нему перекодированием."""
+    if not items:
+        raise ValueError("нечего собирать")
+    weight: dict[Format, float] = {}
+    order: list[Format] = []
+    for info, dur in items:
+        f = format_of(info)
+        if f not in weight:
+            weight[f] = 0.0
+            order.append(f)
+        weight[f] += max(dur, 0.0)
+    return max(order, key=lambda f: (weight[f], -order.index(f)))
+
+
 def keyframes(path: str, progress=None) -> list[float]:
     """Времена всех ключевых кадров видеопотока (сек). Быстрый проход по пакетам."""
     cmd = [FFPROBE, "-v", "error", "-select_streams", "v:0",
@@ -146,8 +189,10 @@ def cut_copy(src: str, start: float, end: float, out: str) -> None:
         raise RuntimeError(f"cut_copy: {p.stderr.strip()[:400]}")
 
 
-def _encoder_args(info: ClipInfo) -> list[str]:
-    if info.vcodec == "hevc":
+def _encoder_args(info: ClipInfo, target: Format | None = None) -> list[str]:
+    vcodec = target.vcodec if target else info.vcodec
+    pix_fmt = target.pix_fmt if target else info.pix_fmt
+    if vcodec == "hevc":
         args = ["-c:v", "libx265", "-crf", "14", "-preset", "fast",
                 "-tag:v", "hvc1"]
     else:
@@ -155,7 +200,7 @@ def _encoder_args(info: ClipInfo) -> list[str]:
         prof = (info.profile or "").lower().replace(" ", "")
         if prof in ("baseline", "main", "high"):
             args += ["-profile:v", prof]
-    args += ["-pix_fmt", info.pix_fmt]
+    args += ["-pix_fmt", pix_fmt]
     cs = info.color
     if cs.get("color_space"):
         args += ["-colorspace", cs["color_space"]]
@@ -166,21 +211,123 @@ def _encoder_args(info: ClipInfo) -> list[str]:
     return args
 
 
-def cut_encode(src: str, start: float, end: float, out: str, info: ClipInfo) -> None:
-    """Точный (перекодирующий) рез маленького кусочка для smart-cut."""
+def _video_filters(info: ClipInfo, target: Format | None, dur: float,
+                   fade_in: float, fade_out: float) -> list[str]:
+    """Приведение к целевому формату + затемнение на стыках."""
+    vf: list[str] = []
+    if target and (info.width, info.height) != (target.width, target.height):
+        # вписываем кадр целиком и добиваем чёрным — без искажения пропорций
+        vf.append(f"scale={target.width}:{target.height}"
+                  ":force_original_aspect_ratio=decrease:flags=lanczos")
+        vf.append(f"pad={target.width}:{target.height}:(ow-iw)/2:(oh-ih)/2:color=black")
+        vf.append("setsar=1")
+    if target and target.fps > 0 and abs(info.fps - target.fps) > 0.01:
+        vf.append(f"fps={target.fps:.6f}")
+    if fade_in > 0:
+        vf.append(f"fade=t=in:st=0:d={fade_in:.3f}:color=black")
+    if fade_out > 0:
+        vf.append(f"fade=t=out:st={max(dur - fade_out, 0.0):.3f}:d={fade_out:.3f}"
+                  ":color=black")
+    return vf
+
+
+def _audio_filters(dur: float, fade_in: float, fade_out: float) -> list[str]:
+    af: list[str] = []
+    if fade_in > 0:
+        af.append(f"afade=t=in:st=0:d={fade_in:.3f}")
+    if fade_out > 0:
+        af.append(f"afade=t=out:st={max(dur - fade_out, 0.0):.3f}:d={fade_out:.3f}")
+    return af
+
+
+def cut_encode(src: str, start: float, end: float, out: str, info: ClipInfo,
+               target: Format | None = None,
+               fade_in: float = 0.0, fade_out: float = 0.0) -> None:
+    """Перекодирующий рез: smart-cut, приведение к целевому формату, затемнения.
+    fade_in/fade_out — длительность затемнения у начала/конца получаемого кусочка."""
+    dur = max(end - start, 0.0)
     cmd = [FFMPEG, "-y", "-v", "error",
-           "-ss", f"{start:.6f}", "-to", f"{end:.6f}", "-i", src,
-           "-map", "0:v:0?", "-map", "0:a:0?"] + _encoder_args(info)
-    if info.acodec:
+           "-ss", f"{start:.6f}", "-to", f"{end:.6f}", "-i", src]
+    silent = target is not None and target.acodec and not info.acodec
+    if silent:                      # у источника нет звука, а дорожка нужна для склейки
+        cmd += ["-f", "lavfi", "-i",
+                f"anullsrc=channel_layout=stereo:sample_rate={target.sample_rate or 48000}",
+                "-shortest"]
+        cmd += ["-map", "0:v:0?", "-map", "1:a:0"]
+    else:
+        cmd += ["-map", "0:v:0?", "-map", "0:a:0?"]
+    vf = _video_filters(info, target, dur, fade_in, fade_out)
+    af = _audio_filters(dur, fade_in, fade_out)
+    if vf:
+        cmd += ["-vf", ",".join(vf)]
+    if af and (info.acodec or silent):
+        cmd += ["-af", ",".join(af)]
+    cmd += _encoder_args(info, target)
+    if info.acodec or silent:
         cmd += ["-c:a", "aac", "-b:a", "256k"]
+        if target and target.sample_rate:
+            cmd += ["-ar", str(target.sample_rate), "-ac", "2"]
     cmd += ["-avoid_negative_ts", "make_zero", out]
     p = _run(cmd)
     if p.returncode != 0:
         raise RuntimeError(f"cut_encode: {p.stderr.strip()[:400]}")
 
 
-def concat(parts: list[str], out: str) -> None:
-    """Склейка однотипных частей без перекодирования (concat demuxer)."""
+def transcode_to(src: str, out: str, target: Format, info: ClipInfo | None = None) -> None:
+    """Перекодировать файл целиком в целевой формат (масштаб + поля, fps, звук)."""
+    info = info or probe(src)
+    cmd = [FFMPEG, "-y", "-v", "error", "-i", src]
+    silent = bool(target.acodec) and not info.acodec
+    if silent:
+        cmd += ["-f", "lavfi", "-i",
+                f"anullsrc=channel_layout=stereo:sample_rate={target.sample_rate or 48000}",
+                "-shortest", "-map", "0:v:0?", "-map", "1:a:0"]
+    else:
+        cmd += ["-map", "0:v:0?", "-map", "0:a:0?"]
+    vf = _video_filters(info, target, info.duration, 0.0, 0.0)
+    if vf:
+        cmd += ["-vf", ",".join(vf)]
+    cmd += _encoder_args(info, target)
+    if info.acodec or silent:
+        cmd += ["-c:a", "aac", "-b:a", "256k"]
+        if target.sample_rate:
+            cmd += ["-ar", str(target.sample_rate), "-ac", "2"]
+    cmd += ["-avoid_negative_ts", "make_zero", out]
+    p = _run(cmd)
+    if p.returncode != 0:
+        raise RuntimeError(f"transcode: {p.stderr.strip()[:400]}")
+
+
+# что обязано совпадать у частей, иначе copy-склейка молча портит таймстампы
+_JOIN_KEY = lambda f: (f.width, f.height, f.vcodec, f.pix_fmt, f.acodec, f.sample_rate)
+
+
+def concat(parts: list[str], out: str, progress=None) -> None:
+    """Склейка частей. Однотипные — без перекодирования; если формат разъехался
+    (разное разрешение/fps-семейство/частота звука), выбивающиеся части сначала
+    приводятся к преобладающему формату — иначе ffmpeg молча выдаёт битый файл."""
+    infos = [probe(p) for p in parts]
+    fmts = [format_of(i) for i in infos]
+    weight: dict[tuple, float] = {}
+    for f, i in zip(fmts, infos):
+        weight[_JOIN_KEY(f)] = weight.get(_JOIN_KEY(f), 0.0) + max(i.duration, 0.0)
+    if len(weight) > 1:
+        win = max(weight, key=weight.get)
+        target = next(f for f in fmts if _JOIN_KEY(f) == win)
+        fixed: list[str] = []
+        odd = [k for k, (f, _) in enumerate(zip(fmts, infos)) if _JOIN_KEY(f) != win]
+        for k, (part, info, f) in enumerate(zip(parts, infos, fmts)):
+            if _JOIN_KEY(f) == win:
+                fixed.append(part)
+                continue
+            if progress:
+                progress(f"Приведение части {odd.index(k) + 1}/{len(odd)} "
+                         f"({f}) к {target}")
+            norm = str(Path(part).with_name(Path(part).stem + "_norm.mp4"))
+            transcode_to(part, norm, target, info)
+            fixed.append(norm)
+        parts = fixed
+
     lst = Path(out).with_suffix(".concat.txt")
     esc = lambda s: s.replace("'", r"'\''")
     lst.write_text("".join(f"file '{esc(os.path.abspath(x))}'\n" for x in parts),
@@ -190,6 +337,27 @@ def concat(parts: list[str], out: str) -> None:
     lst.unlink(missing_ok=True)
     if p.returncode != 0:
         raise RuntimeError(f"concat: {p.stderr.strip()[:400]}")
+    check_result(out)
+
+
+def check_result(path: str) -> None:
+    """Проверка склейки: ffmpeg при рассинхроне таймстампов не возвращает ошибку,
+    но видеодорожка обрывается раньше звука — ловим это здесь."""
+    p = _run([FFPROBE, "-v", "error", "-print_format", "json",
+              "-show_format", "-show_streams", path])
+    if p.returncode != 0:
+        raise RuntimeError(f"результат не читается: {p.stderr.strip()[:200]}")
+    data = json.loads(p.stdout)
+    total = float(data["format"].get("duration") or 0.0)
+    v = next((s for s in data["streams"] if s.get("codec_type") == "video"), None)
+    if v is None or total <= 0:
+        raise RuntimeError("в результате нет видеодорожки")
+    vdur = float(v.get("duration") or 0.0)
+    if vdur and vdur < total - 1.0:
+        raise RuntimeError(
+            f"склейка испортила таймстампы: видео обрывается на {vdur:.1f} с "
+            f"при общей длине {total:.1f} с. Обычно так бывает, когда куски сняты "
+            f"в разных форматах")
 
 
 def extract_frame(src: str, t: float, out: str, fmt: str = "jpeg") -> None:

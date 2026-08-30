@@ -175,10 +175,27 @@ class Project:
         return True
 
     # ---------------- компиляция
-    def compile(self, out_path: str, smart: bool, progress=None) -> None:
-        """Собрать все сегменты в один файл. smart=False — рез по ключевым кадрам."""
+    def target_format(self) -> ft.Format:
+        """Формат сборки: тот, в котором снято больше всего материала монтажа."""
+        return ft.choose_target([(s.clip.info, s.duration) for s in self.segments])
+
+    def foreign_segments(self) -> list[Segment]:
+        """Сегменты, снятые не в целевом формате: их придётся перекодировать."""
+        if not self.segments:
+            return []
+        tgt = self.target_format()
+        return [s for s in self.segments if not ft.same_format(s.clip.info, tgt)]
+
+    def compile(self, out_path: str, smart: bool, progress=None,
+                transition: float = 0.0) -> None:
+        """Собрать все сегменты в один файл.
+        smart=False — рез по ключевым кадрам; transition — полная длительность
+        «моргания» на стыке (делится поровну: затухание конца куска + проявление
+        начала следующего), 0 — без переходов. Куски, снятые в другом формате,
+        приводятся к формату основного материала."""
         if not self.segments:
             raise RuntimeError("Нет сегментов")
+        target = self.target_format()
         tmpdir = tempfile.mkdtemp(prefix="tripcut_")
         parts: list[str] = []
         n = len(self.segments)
@@ -186,27 +203,41 @@ class Project:
             for i, seg in enumerate(self.segments):
                 if progress:
                     progress(i, n, f"Сегмент {i + 1}/{n}")
-                kf = seg.clip.keyframes
-                if not smart:
-                    a = ft.snap_to_keyframe(kf, seg.start, "nearest") if kf else seg.start
-                    b = seg.end
-                    part = os.path.join(tmpdir, f"p{i:03d}.mp4")
-                    ft.cut_copy(seg.clip.path, a, b, part)
-                    parts.append(part)
+                # затемняем только внутренние стыки: начало и конец фильма не трогаем
+                half = transition / 2.0
+                fin = half if (transition > 0 and i > 0) else 0.0
+                fout = half if (transition > 0 and i < n - 1) else 0.0
+                if not ft.same_format(seg.clip.info, target):
+                    p = os.path.join(tmpdir, f"p{i:03d}_conv.mp4")
+                    ft.cut_encode(seg.clip.path, seg.start, seg.end, p, seg.clip.info,
+                                  target=target, fade_in=fin, fade_out=fout)
+                    parts.append(p)
+                elif fin > 0 or fout > 0:
+                    parts.extend(self._fade_parts(seg, tmpdir, i, target, fin, fout,
+                                                  smart))
+                elif smart:
+                    parts.extend(self._smart_parts(seg, tmpdir, i, target))
                 else:
-                    parts.extend(self._smart_parts(seg, tmpdir, i))
+                    kf = seg.clip.keyframes
+                    a = ft.snap_to_keyframe(kf, seg.start, "nearest") if kf else seg.start
+                    part = os.path.join(tmpdir, f"p{i:03d}.mp4")
+                    ft.cut_copy(seg.clip.path, a, seg.end, part)
+                    parts.append(part)
             if progress:
                 progress(n, n, "Склейка…")
             if len(parts) == 1:
                 import shutil
                 shutil.move(parts[0], out_path)
+                ft.check_result(out_path)
             else:
-                ft.concat(parts, out_path)
+                ft.concat(parts, out_path,
+                          progress=(lambda m: progress(n, n, m)) if progress else None)
         finally:
             import shutil
             shutil.rmtree(tmpdir, ignore_errors=True)
 
-    def _smart_parts(self, seg: Segment, tmpdir: str, i: int) -> list[str]:
+    def _smart_parts(self, seg: Segment, tmpdir: str, i: int,
+                     target: ft.Format | None = None) -> list[str]:
         """Smart-cut: голова/хвост перекодируются, середина копируется."""
         kf = seg.clip.keyframes
         info = seg.clip.info
@@ -218,18 +249,53 @@ class Project:
         if kf_in >= kf_out - eps:
             # сегмент внутри одного GOP — целиком перекодировать
             p = os.path.join(tmpdir, f"p{i:03d}_enc.mp4")
-            ft.cut_encode(seg.clip.path, a, b, p, info)
+            ft.cut_encode(seg.clip.path, a, b, p, info, target=target)
             return [p]
         if kf_in - a > eps:
             p = os.path.join(tmpdir, f"p{i:03d}_head.mp4")
-            ft.cut_encode(seg.clip.path, a, kf_in, p, info)
+            ft.cut_encode(seg.clip.path, a, kf_in, p, info, target=target)
             parts.append(p)
         p = os.path.join(tmpdir, f"p{i:03d}_mid.mp4")
         ft.cut_copy(seg.clip.path, kf_in, kf_out, p)
         parts.append(p)
         if b - kf_out > eps:
             p = os.path.join(tmpdir, f"p{i:03d}_tail.mp4")
-            ft.cut_encode(seg.clip.path, kf_out, b, p, info)
+            ft.cut_encode(seg.clip.path, kf_out, b, p, info, target=target)
+            parts.append(p)
+        return parts
+
+    def _fade_parts(self, seg: Segment, tmpdir: str, i: int, target: ft.Format,
+                    fin: float, fout: float, smart: bool) -> list[str]:
+        """Переходы: перекодируются только кусочки под затемнение (до ближайшего
+        ключевого кадра), середина сегмента копируется как есть."""
+        kf = seg.clip.keyframes
+        info = seg.clip.info
+        # начало: в smart — точное, иначе прилипает к ключевому кадру, как и без переходов
+        a = seg.start if smart else (ft.snap_to_keyframe(kf, seg.start, "nearest")
+                                     if kf else seg.start)
+        b = seg.end
+        eps = 0.05
+        head_end = ft.snap_to_keyframe(kf, a + fin, "ceil") if (fin > 0 and kf) else a
+        tail_start = ft.snap_to_keyframe(kf, b - fout, "floor") if (fout > 0 and kf) else b
+        if head_end >= tail_start - eps or (b - a) < fin + fout + eps:
+            # сегмент короче, чем два затемнения — перекодируем целиком
+            p = os.path.join(tmpdir, f"p{i:03d}_enc.mp4")
+            ft.cut_encode(seg.clip.path, a, b, p, info, target=target,
+                          fade_in=fin, fade_out=fout)
+            return [p]
+        parts: list[str] = []
+        if fin > 0:
+            p = os.path.join(tmpdir, f"p{i:03d}_1in.mp4")
+            ft.cut_encode(seg.clip.path, a, head_end, p, info, target=target,
+                          fade_in=fin)
+            parts.append(p)
+        p = os.path.join(tmpdir, f"p{i:03d}_2mid.mp4")
+        ft.cut_copy(seg.clip.path, head_end, tail_start, p)
+        parts.append(p)
+        if fout > 0:
+            p = os.path.join(tmpdir, f"p{i:03d}_3out.mp4")
+            ft.cut_encode(seg.clip.path, tail_start, b, p, info, target=target,
+                          fade_out=fout)
             parts.append(p)
         return parts
 

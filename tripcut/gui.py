@@ -70,6 +70,15 @@ class Settings:
     def smart_cut(self, v):
         self.q.setValue("smart_cut", v)
 
+    @property
+    def transition(self) -> float:
+        """Длительность затемнения на стыках, сек. 0 — переходы выключены."""
+        return self.q.value("transition", 0.0, float)
+
+    @transition.setter
+    def transition(self, v):
+        self.q.setValue("transition", float(v))
+
     def geo(self) -> M.GeoConfig:
         def fnum(key):
             raw = self.q.value(key, "", str)
@@ -114,6 +123,21 @@ class SettingsDialog(QDialog):
         self.smart_cb.setChecked(st.smart_cut)
         form.addRow("Компиляция:", self.smart_cb)
 
+        self.tr_cb = QCheckBox("Плавные переходы: короткое затемнение на стыках")
+        self.tr_cb.setChecked(st.transition > 0)
+        self.tr_spin = QDoubleSpinBox()
+        self.tr_spin.setRange(0.05, 1.0); self.tr_spin.setDecimals(2)
+        self.tr_spin.setSingleStep(0.05); self.tr_spin.setSuffix(" с")
+        self.tr_spin.setValue(st.transition if st.transition > 0 else 0.2)
+        self.tr_spin.setEnabled(self.tr_cb.isChecked())
+        self.tr_cb.toggled.connect(self.tr_spin.setEnabled)
+        row_tr = QHBoxLayout(); row_tr.addWidget(self.tr_cb); row_tr.addWidget(self.tr_spin)
+        form.addRow("Переходы:", row_tr)
+        hint = QLabel("Затемнение делится поровну между концом одного куска и началом\n"
+                      "следующего: 0.2 с — короткое «моргание», содержимое не съедает.")
+        hint.setStyleSheet("color:#888;")
+        form.addRow(hint)
+
         self.geo_mode = QComboBox()
         for key, label in [("auto", "Авто (GPS камеры → трек → ручная точка)"),
                            ("camera", "Только GPS камеры (GoPro)"),
@@ -148,6 +172,7 @@ class SettingsDialog(QDialog):
         self.st.photo_dir = self.dir_edit.text().strip()
         self.st.photo_fmt = "png" if self.png_cb.isChecked() else "jpeg"
         self.st.smart_cut = self.smart_cb.isChecked()
+        self.st.transition = self.tr_spin.value() if self.tr_cb.isChecked() else 0.0
         lat = lon = None
         raw = self.lat_edit.text().replace(";", ",").strip()
         if "," in raw and not self.lon_edit.text().strip():
@@ -853,12 +878,28 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "TripCut",
                                     "Ещё идёт индексация ключевых кадров — секунду…")
             return
+        target = self.project.target_format()
+        foreign = self.project.foreign_segments()
+        if foreign:
+            fmts = sorted({str(ft.format_of(s.clip.info)) for s in foreign})
+            names = sorted({s.clip.name for s in foreign})
+            if QMessageBox.question(
+                    self, "TripCut",
+                    f"Куски сняты в разных форматах.\n\n"
+                    f"Основной формат сборки: {target}\n"
+                    f"Не совпадают ({len(foreign)} шт.): " + ", ".join(names[:6]) +
+                    ("…" if len(names) > 6 else "") + "\n  " + "\n  ".join(fmts) +
+                    "\n\nЭти куски будут перекодированы под основной формат "
+                    "(вписаны в кадр, поля — чёрные). Это дольше обычного.\n"
+                    "Продолжить?") != QMessageBox.Yes:
+                return
         first = self.project.segments[0].clip.path
         default = str(Path(first).with_name(Path(first).stem + "_cut.mp4"))
         out, _ = QFileDialog.getSaveFileName(self, "Сохранить видео", default, "MP4 (*.mp4)")
         if not out:
             return
         smart = self.st.smart_cut
+        transition = self.st.transition
         dlg = QProgressDialog("Компиляция…", None, 0, 100, self)
         dlg.setWindowTitle("TripCut")
         dlg.setWindowModality(Qt.WindowModal)
@@ -882,13 +923,17 @@ class MainWindow(QMainWindow):
                 self.statusBar().showMessage(f"✅ Готово: {out}", 10000)
                 QMessageBox.information(
                     self, "TripCut",
-                    f"Готово!\n{out}\n\nРежим: {'точный (smart)' if smart else 'по ключевым кадрам'}")
+                    f"Готово!\n{out}\n\n"
+                    f"Режим: {'точный (smart)' if smart else 'по ключевым кадрам'}\n"
+                    f"Формат: {target}\n"
+                    f"Переходы: {f'затемнение {transition:g} с' if transition else 'нет'}")
 
         note.done.connect(on_note)
 
         def work():
             try:
-                self.project.compile(out, smart=smart, progress=prog)
+                self.project.compile(out, smart=smart, progress=prog,
+                                     transition=transition)
                 note.done.emit("done", None)
             except Exception as e:                  # noqa: BLE001
                 traceback.print_exc()
