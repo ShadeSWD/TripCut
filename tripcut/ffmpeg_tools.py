@@ -48,6 +48,7 @@ class ClipInfo:
     creation_time: datetime | None      # локальное время камеры (наивное), см. probe()
     gpmd_stream: int | None             # индекс потока GoPro-телеметрии, если есть
     color: dict = field(default_factory=dict)
+    timescale: int = 0                  # знаменатель time_base видеодорожки (1/30000 -> 30000)
 
 
 def probe(path: str, utc_offset_h: float = 0.0) -> ClipInfo:
@@ -84,6 +85,16 @@ def probe(path: str, utc_offset_h: float = 0.0) -> ClipInfo:
     color = {k: v[k] for k in ("color_space", "color_transfer", "color_primaries", "color_range")
              if v.get(k)}
 
+    # шкала времени: части с разной шкалой нельзя склеить копированием — mp4-муксер
+    # запишет чужие метки как свои, и видео растянется (30000/11988 = 2.5 раза)
+    ts = 0
+    tb = v.get("time_base") or ""
+    if "/" in tb:
+        try:
+            ts = int(tb.split("/")[1])
+        except ValueError:
+            ts = 0
+
     return ClipInfo(
         path=path,
         duration=float(data["format"]["duration"]),
@@ -92,7 +103,7 @@ def probe(path: str, utc_offset_h: float = 0.0) -> ClipInfo:
         profile=v.get("profile", ""),
         acodec=a["codec_name"] if a else None,
         sample_rate=int(a["sample_rate"]) if a else None,
-        creation_time=ct, gpmd_stream=gpmd, color=color,
+        creation_time=ct, gpmd_stream=gpmd, color=color, timescale=ts,
     )
 
 
@@ -320,7 +331,8 @@ def _audio_filters(dur: float, fade_in: float, fade_out: float) -> list[str]:
 
 def cut_encode(src: str, start: float, end: float, out: str, info: ClipInfo,
                target: Format | None = None,
-               fade_in: float = 0.0, fade_out: float = 0.0) -> None:
+               fade_in: float = 0.0, fade_out: float = 0.0,
+               timescale: int | None = None) -> None:
     """Перекодирующий рез: smart-cut, приведение к целевому формату, затемнения.
     fade_in/fade_out — длительность затемнения у начала/конца получаемого кусочка."""
     dur = max(end - start, 0.0)
@@ -345,13 +357,16 @@ def cut_encode(src: str, start: float, end: float, out: str, info: ClipInfo,
         cmd += ["-c:a", "aac", "-b:a", "256k"]
         if target and target.sample_rate:
             cmd += ["-ar", str(target.sample_rate), "-ac", "2"]
+    if timescale:
+        cmd += ["-video_track_timescale", str(timescale)]
     cmd += ["-avoid_negative_ts", "make_zero", out]
     p = _run(cmd)
     if p.returncode != 0:
         raise RuntimeError(f"cut_encode: {p.stderr.strip()[:400]}")
 
 
-def transcode_to(src: str, out: str, target: Format, info: ClipInfo | None = None) -> None:
+def transcode_to(src: str, out: str, target: Format, info: ClipInfo | None = None,
+                 timescale: int | None = None) -> None:
     """Перекодировать файл целиком в целевой формат (масштаб + поля, fps, звук)."""
     info = info or probe(src)
     cmd = [FFMPEG, "-y", "-v", "error", "-i", src]
@@ -370,6 +385,8 @@ def transcode_to(src: str, out: str, target: Format, info: ClipInfo | None = Non
         cmd += ["-c:a", "aac", "-b:a", "256k"]
         if target.sample_rate:
             cmd += ["-ar", str(target.sample_rate), "-ac", "2"]
+    if timescale:
+        cmd += ["-video_track_timescale", str(timescale)]
     cmd += ["-avoid_negative_ts", "make_zero", out]
     p = _run(cmd)
     if p.returncode != 0:
@@ -380,7 +397,8 @@ def transcode_to(src: str, out: str, target: Format, info: ClipInfo | None = Non
 _JOIN_KEY = lambda f: (f.width, f.height, f.vcodec, f.pix_fmt, f.acodec, f.sample_rate)
 
 
-def concat(parts: list[str], out: str, progress=None) -> None:
+def concat(parts: list[str], out: str, progress=None,
+           expected: float | None = None) -> None:
     """Склейка частей. Однотипные — без перекодирования; если формат разъехался
     (разное разрешение/fps-семейство/частота звука), выбивающиеся части сначала
     приводятся к преобладающему формату — иначе ffmpeg молча выдаёт битый файл."""
@@ -392,6 +410,7 @@ def concat(parts: list[str], out: str, progress=None) -> None:
     if len(weight) > 1:
         win = max(weight, key=weight.get)
         target = next(f for f in fmts if _JOIN_KEY(f) == win)
+        ts = next(i.timescale for i, f in zip(infos, fmts) if _JOIN_KEY(f) == win)
         fixed: list[str] = []
         odd = [k for k, (f, _) in enumerate(zip(fmts, infos)) if _JOIN_KEY(f) != win]
         for k, (part, info, f) in enumerate(zip(parts, infos, fmts)):
@@ -402,7 +421,7 @@ def concat(parts: list[str], out: str, progress=None) -> None:
                 progress(f"Приведение части {odd.index(k) + 1}/{len(odd)} "
                          f"({f}) к {target}")
             norm = str(Path(part).with_name(Path(part).stem + "_norm.mp4"))
-            transcode_to(part, norm, target, info)
+            transcode_to(part, norm, target, info, timescale=ts)
             fixed.append(norm)
         parts = fixed
 
@@ -415,12 +434,13 @@ def concat(parts: list[str], out: str, progress=None) -> None:
     lst.unlink(missing_ok=True)
     if p.returncode != 0:
         raise RuntimeError(f"concat: {p.stderr.strip()[:400]}")
-    check_result(out)
+    check_result(out, expected)
 
 
-def check_result(path: str) -> None:
-    """Проверка склейки: ffmpeg при рассинхроне таймстампов не возвращает ошибку,
-    но видеодорожка обрывается раньше звука — ловим это здесь."""
+def check_result(path: str, expected: float | None = None) -> None:
+    """Проверка склейки: ffmpeg при беде с таймстампами не возвращает ошибку —
+    видеодорожка либо обрывается раньше звука, либо растягивается (части с разной
+    шкалой времени). Сверяем дорожки между собой и с ожидаемой длиной монтажа."""
     p = _run([FFPROBE, "-v", "error", "-print_format", "json",
               "-show_format", "-show_streams", path])
     if p.returncode != 0:
@@ -436,6 +456,15 @@ def check_result(path: str) -> None:
             f"склейка испортила таймстампы: видео обрывается на {vdur:.1f} с "
             f"при общей длине {total:.1f} с. Обычно так бывает, когда куски сняты "
             f"в разных форматах")
+    a = next((s for s in data["streams"] if s.get("codec_type") == "audio"), None)
+    adur = float((a or {}).get("duration") or 0.0)
+    if vdur and adur and abs(vdur - adur) > 1.0:
+        raise RuntimeError(
+            f"склейка испортила таймстампы: видео {vdur:.1f} с, звук {adur:.1f} с")
+    if expected and abs(total - expected) > max(2.0, expected * 0.02):
+        raise RuntimeError(
+            f"длина результата {total:.1f} с вместо ожидаемых {expected:.1f} с — "
+            f"скорее всего у частей разная шкала времени")
 
 
 def extract_frame(src: str, t: float, out: str, fmt: str = "jpeg") -> None:
