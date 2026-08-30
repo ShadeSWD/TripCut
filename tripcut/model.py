@@ -138,6 +138,34 @@ class Project:
         self.segments.insert(i + 1, right)
         return True
 
+    def move_segment(self, src: int, dst: int) -> bool:
+        """Перетаскивание: сегмент src встаёт на позицию dst (индекс в списке
+        уже без перетаскиваемого сегмента)."""
+        n = len(self.segments)
+        if n < 2 or not (0 <= src < n):
+            return False
+        dst = max(0, min(dst, n - 1))
+        if dst == src:
+            return False
+        self._push_undo()
+        seg = self.segments.pop(src)
+        self.segments.insert(dst, seg)
+        return True
+
+    def reorder_clips(self, new_order: list[Clip]) -> bool:
+        """Новый порядок клипов (перетаскивание в панели клипов). Сегменты
+        пересобираются группами по клипам — куски одного видео едут вместе,
+        их взаимный порядок сохраняется."""
+        if sorted(map(id, new_order)) != sorted(map(id, self.clips)):
+            return False
+        rank = {id(c): i for i, c in enumerate(new_order)}
+        if [rank[id(c)] for c in self.clips] == list(range(len(self.clips))):
+            return False
+        self._push_undo()
+        self.clips = list(new_order)
+        self.segments.sort(key=lambda s: rank[id(s.clip)])
+        return True
+
     def delete_segment(self, gt: float) -> bool:
         loc = self.locate(gt)
         if not loc or len(self.segments) <= 1:

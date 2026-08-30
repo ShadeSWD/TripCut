@@ -10,10 +10,10 @@ from pathlib import Path
 from PySide6.QtCore import Qt, QSettings, Signal, QObject, QTimer
 from PySide6.QtGui import QAction, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
-    QApplication, QComboBox, QCheckBox, QDateTimeEdit, QDialog, QDialogButtonBox,
-    QDoubleSpinBox, QFileDialog, QFormLayout, QHBoxLayout, QLabel, QLineEdit,
-    QListWidget, QListWidgetItem, QMainWindow, QMenu, QMessageBox, QProgressDialog,
-    QPushButton, QSplitter, QVBoxLayout, QWidget, QStatusBar,
+    QAbstractItemView, QApplication, QComboBox, QCheckBox, QDateTimeEdit, QDialog,
+    QDialogButtonBox, QDoubleSpinBox, QFileDialog, QFormLayout, QHBoxLayout, QLabel,
+    QLineEdit, QListWidget, QListWidgetItem, QMainWindow, QMenu, QMessageBox,
+    QProgressDialog, QPushButton, QSplitter, QVBoxLayout, QWidget, QStatusBar,
 )
 
 from . import ffmpeg_tools as ft
@@ -195,12 +195,55 @@ class ClipTimeDialog(QDialog):
         super().accept()
 
 
+# ---------------------------------------------------------------- панель клипов
+
+class ClipListWidget(QListWidget):
+    """Список клипов с перетаскиванием строк. Порядок меняем сами: в данных
+    строк лежат Python-объекты Clip, штатный InternalMove их бы потерял."""
+
+    order_changed = Signal(list)      # новый порядок клипов
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setDragEnabled(True)
+        self.setAcceptDrops(True)
+        self.viewport().setAcceptDrops(True)
+        self.setDragDropMode(QAbstractItemView.InternalMove)
+        self.setDropIndicatorShown(True)
+        self.setDefaultDropAction(Qt.MoveAction)
+        self.setSelectionMode(QAbstractItemView.ExtendedSelection)
+
+    def dropEvent(self, ev):
+        if ev.source() is not self:
+            ev.ignore()
+            return
+        rows = sorted(self.row(it) for it in self.selectedItems())
+        clips = [self.item(i).data(Qt.UserRole) for i in range(self.count())]
+        if not rows or not clips:
+            ev.ignore()
+            return
+        idx = self.indexAt(ev.position().toPoint())
+        dst = idx.row() if idx.isValid() else self.count()
+        if idx.isValid() and self.dropIndicatorPosition() == QAbstractItemView.BelowItem:
+            dst += 1
+        dst -= sum(1 for r in rows if r < dst)          # позиция уже без перенесённых
+        moving = [clips[r] for r in rows]
+        rest = [c for i, c in enumerate(clips) if i not in set(rows)]
+        # IgnoreAction — чтобы Qt после drop не удалил «перенесённые» строки сам:
+        # список целиком пересобирает MainWindow из нового порядка
+        ev.setDropAction(Qt.IgnoreAction)
+        ev.accept()
+        self.order_changed.emit(rest[:dst] + moving + rest[dst:])
+
+
 # ---------------------------------------------------------------- главное окно
 
 class MainWindow(QMainWindow):
     HELP = ("Space — играть/пауза   ←/→ — ±5с   ,/. — кадр   PgUp/PgDn — пред./след. видео   "
             "Q — убрать слева   W — убрать справа   E — рассечь   Del — удалить сегмент "
-            "(в списке клипов — клип)   / — кадр в фото   Ctrl+Z — отмена")
+            "(в списке клипов — клип)   / — кадр в фото   Ctrl+Z — отмена\n"
+            "Порядок: тяни кусок за полоску сверху на таймлайне (или Alt+тяни) · "
+            "Alt+←/→ — сдвинуть кусок · клипы в списке справа тоже перетаскиваются")
     HELP_QUICK = ("⚡ Быстрый режим: только фото.   / — кадр в фото   Space — играть/пауза   "
                   "←/→ — ±5с   ,/. — кадр   PgUp/PgDn — пред./след. видео   "
                   "Del в списке клипов — убрать клип")
@@ -254,13 +297,13 @@ class MainWindow(QMainWindow):
         split.addWidget(self.player)
 
         right = QWidget(); rv = QVBoxLayout(right); rv.setContentsMargins(0, 0, 0, 0)
-        rv.addWidget(QLabel("Клипы (двойной клик — время старта):"))
-        self.clip_list = QListWidget()
+        rv.addWidget(QLabel("Клипы (двойной клик — время старта, тяни — порядок):"))
+        self.clip_list = ClipListWidget()
         self.clip_list.setFocusPolicy(Qt.ClickFocus)   # Del по выбранному клипу
-        self.clip_list.setSelectionMode(QListWidget.ExtendedSelection)
         self.clip_list.setContextMenuPolicy(Qt.CustomContextMenu)
         self.clip_list.customContextMenuRequested.connect(self._clip_menu)
         self.clip_list.itemDoubleClicked.connect(self._edit_clip_time)
+        self.clip_list.order_changed.connect(self._reorder_clips)
         rv.addWidget(self.clip_list)
         right.setMaximumWidth(320)
         split.addWidget(right)
@@ -273,6 +316,7 @@ class MainWindow(QMainWindow):
 
         self.timeline = TimelineWidget(self.project)
         self.timeline.seek_requested.connect(self.seek_global)
+        self.timeline.reorder_requested.connect(self._reorder_segment)
         v.addWidget(self.timeline)
 
         self.hint = QLabel(self.HELP)
@@ -299,6 +343,10 @@ class MainWindow(QMainWindow):
         key(Qt.Key_Period, lambda: self._frame(back=False))
         key(Qt.Key_PageDown, lambda: self.jump_clip(1))
         key(Qt.Key_PageUp, lambda: self.jump_clip(-1))
+        key("Alt+Left", lambda: self._nudge_segment(-1))
+        key("Alt+Right", lambda: self._nudge_segment(1))
+        key("Alt+Up", lambda: self._nudge_selected_clips(-1))
+        key("Alt+Down", lambda: self._nudge_selected_clips(1))
         key(QKeySequence.Undo, self._undo)
 
         self._suppress_time = False
@@ -465,12 +513,16 @@ class MainWindow(QMainWindow):
             return
         menu = QMenu(self)
         act_time = menu.addAction("Время старта…")
+        act_up = menu.addAction("Выше (Alt+↑)")
+        act_down = menu.addAction("Ниже (Alt+↓)")
         act_del = menu.addAction("Удалить клип (Del)")
         chosen = menu.exec(self.clip_list.mapToGlobal(pos))
         if chosen is act_del:
             self._remove_selected_clips()
         elif chosen is act_time:
             self._edit_clip_time(item)
+        elif chosen in (act_up, act_down):
+            self._nudge_clip(item, -1 if chosen is act_up else 1)
 
     def _on_delete(self):
         """Del: в панели клипов удаляет клип, иначе — сегмент под курсором."""
@@ -500,6 +552,75 @@ class MainWindow(QMainWindow):
         names = ", ".join(c.name for c in removed)
         self.statusBar().showMessage(
             f"Удалено клипов: {len(removed)} ({names}) · Ctrl+Z вернёт", 5000)
+
+    # ---------------- порядок кусков и клипов
+    def _reorder_segment(self, src: int, dst: int):
+        """Перетаскивание куска на таймлайне: сегмент src встаёт на позицию dst."""
+        if self.quick_mode:
+            self.statusBar().showMessage(
+                "⚡ Быстрый режим — только фото. «В полный редактор» включит монтаж", 5000)
+            return
+        if not self.project.move_segment(src, dst):
+            return
+        self._follow_segment(dst)
+        self.statusBar().showMessage(
+            f"Кусок {src + 1} → позиция {dst + 1} · Ctrl+Z вернёт", 4000)
+
+    def _nudge_segment(self, delta: int):
+        """Alt+←/→: сдвинуть кусок под курсором на одну позицию."""
+        if self.quick_mode or not self.project.segments:
+            return
+        loc = self.project.locate(self.cur_global)
+        if not loc:
+            return
+        src = loc[2]
+        dst = src + delta
+        if not (0 <= dst < len(self.project.segments)) or not self.project.move_segment(src, dst):
+            return
+        self._follow_segment(dst)
+        self.statusBar().showMessage(
+            f"Кусок {src + 1} → позиция {dst + 1} · Ctrl+Z вернёт", 4000)
+
+    def _follow_segment(self, i: int):
+        """После перестановки — встать курсором на начало переехавшего куска."""
+        self.active_idx = i
+        self.timeline.update()
+        self.seek_global(self.project.global_of(i, self.project.segments[i].start) + 0.001)
+        self._update_status()
+
+    def _reorder_clips(self, new_order: list):
+        """Перетаскивание в панели клипов: куски одного видео едут вместе."""
+        if not self.project.reorder_clips(new_order):
+            self._rebuild_clip_list()          # порядок не изменился — вернуть как было
+            return
+        self._rebuild_clip_list()
+        self.active_idx = 0
+        self.timeline.update()
+        self.seek_global(0.0)
+        self._update_status()
+        self.statusBar().showMessage(
+            "Порядок клипов изменён · Ctrl+Z вернёт", 4000)
+
+    def _nudge_clip(self, item: QListWidgetItem, delta: int):
+        """Клип на строку выше/ниже (контекстное меню, Alt+↑/↓)."""
+        clip = item.data(Qt.UserRole)
+        clips = list(self.project.clips)
+        i = next((k for k, c in enumerate(clips) if c is clip), None)
+        j = None if i is None else i + delta
+        if j is None or not (0 <= j < len(clips)):
+            return
+        clips[i], clips[j] = clips[j], clips[i]
+        self._reorder_clips(clips)
+        for row in range(self.clip_list.count()):       # выделение едет за клипом
+            if self.clip_list.item(row).data(Qt.UserRole) is clip:
+                self.clip_list.setCurrentRow(row)
+                break
+
+    def _nudge_selected_clips(self, delta: int):
+        """Alt+↑/↓: выбранный в панели клип — на строку выше/ниже."""
+        items = self.clip_list.selectedItems()
+        if len(items) == 1:
+            self._nudge_clip(items[0], delta)
 
     def _edit_clip_time(self, item: QListWidgetItem):
         clip = item.data(Qt.UserRole)
