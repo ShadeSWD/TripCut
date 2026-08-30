@@ -189,9 +189,73 @@ def cut_copy(src: str, start: float, end: float, out: str) -> None:
         raise RuntimeError(f"cut_copy: {p.stderr.strip()[:400]}")
 
 
+HW_ACCEL = True          # пробовать аппаратный кодировщик (ставится из настроек)
+_HW_CACHE: dict[tuple, str | None] = {}
+
+# кандидаты по убыванию качества/предпочтения; пригодность проверяется пробой
+_HW_CANDIDATES = {
+    "hevc": ["hevc_qsv", "hevc_nvenc", "hevc_amf"],
+    "h264": ["h264_qsv", "h264_nvenc", "h264_amf"],
+}
+
+
+def _hw_quality_args(name: str) -> list[str]:
+    if name.endswith("_qsv"):
+        return ["-global_quality", "18"]
+    if name.endswith("_nvenc"):
+        return ["-preset", "p5", "-rc", "constqp", "-qp", "18"]
+    return ["-rc", "cqp", "-qp_i", "18", "-qp_p", "18"]      # amf
+
+
+def hw_encoder(vcodec: str, width: int, height: int, pix_fmt: str) -> str | None:
+    """Аппаратный кодировщик, который реально работает на этой машине и на этом
+    размере кадра. Наличия в списке ffmpeg мало: nvenc, например, отказывает при
+    старом драйвере, а у QSV/AMF бывает предел разрешения — поэтому пробуем."""
+    if not HW_ACCEL:
+        return None
+    key = (vcodec, width, height, pix_fmt)
+    if key in _HW_CACHE:
+        return _HW_CACHE[key]
+    have = _run([FFMPEG, "-v", "error", "-hide_banner", "-encoders"]).stdout
+    found = None
+    for name in _HW_CANDIDATES.get(vcodec, []):
+        if name not in have:
+            continue
+        p = _run([FFMPEG, "-v", "error", "-f", "lavfi", "-i",
+                  f"testsrc2=size={width}x{height}:rate=30:duration=0.2",
+                  "-c:v", name, *_hw_quality_args(name), "-pix_fmt", pix_fmt,
+                  "-frames:v", "2", "-f", "null", "-"], timeout=90)
+        if p.returncode == 0:
+            found = name
+            break
+    _HW_CACHE[key] = found
+    return found
+
+
+def used_encoder(target: Format) -> str:
+    """Каким кодировщиком шло перекодирование (после компиляции — для отчёта)."""
+    hw = _HW_CACHE.get((target.vcodec, target.width, target.height, target.pix_fmt))
+    return hw or ("libx265" if target.vcodec == "hevc" else "libx264")
+
+
 def _encoder_args(info: ClipInfo, target: Format | None = None) -> list[str]:
     vcodec = target.vcodec if target else info.vcodec
     pix_fmt = target.pix_fmt if target else info.pix_fmt
+    hw = hw_encoder(vcodec, target.width if target else info.width,
+                    target.height if target else info.height, pix_fmt)
+    if hw:
+        args = ["-c:v", hw, *_hw_quality_args(hw), "-pix_fmt", pix_fmt,
+                "-color_range", "pc" if _range_of(pix_fmt) == "full" else "tv"]
+        if vcodec == "hevc":
+            args += ["-tag:v", "hvc1"]
+        cs = info.color
+        if cs.get("color_primaries"):
+            args += ["-color_primaries", cs["color_primaries"]]
+        if cs.get("color_transfer"):
+            args += ["-color_trc", cs["color_transfer"]]
+        if cs.get("color_space"):
+            args += ["-colorspace", cs["color_space"]]
+        return args
     if vcodec == "hevc":
         args = ["-c:v", "libx265", "-crf", "14", "-preset", "fast",
                 "-tag:v", "hvc1"]
@@ -200,7 +264,8 @@ def _encoder_args(info: ClipInfo, target: Format | None = None) -> list[str]:
         prof = (info.profile or "").lower().replace(" ", "")
         if prof in ("baseline", "main", "high"):
             args += ["-profile:v", prof]
-    args += ["-pix_fmt", pix_fmt]
+    args += ["-pix_fmt", pix_fmt,
+             "-color_range", "pc" if _range_of(pix_fmt) == "full" else "tv"]
     cs = info.color
     if cs.get("color_space"):
         args += ["-colorspace", cs["color_space"]]
@@ -209,6 +274,11 @@ def _encoder_args(info: ClipInfo, target: Format | None = None) -> list[str]:
     if cs.get("color_transfer"):
         args += ["-color_trc", cs["color_transfer"]]
     return args
+
+
+def _range_of(pix_fmt: str) -> str:
+    """yuvj420p и т.п. — полный диапазон (0-255), остальное — телевизионный."""
+    return "full" if (pix_fmt or "").startswith("yuvj") else "limited"
 
 
 def _video_filters(info: ClipInfo, target: Format | None, dur: float,
@@ -221,6 +291,14 @@ def _video_filters(info: ClipInfo, target: Format | None, dur: float,
                   ":force_original_aspect_ratio=decrease:flags=lanczos")
         vf.append(f"pad={target.width}:{target.height}:(ow-iw)/2:(oh-ih)/2:color=black")
         vf.append("setsar=1")
+    if target and _range_of(info.pix_fmt) != _range_of(target.pix_fmt):
+        # GoPro пишет полный диапазон, телефон — телевизионный. Без явного перевода
+        # кодировщик оставляет диапазон источника, и на стыке скачут яркость с контрастом
+        rng = _range_of(target.pix_fmt)
+        if vf and vf[0].startswith("scale="):
+            vf[0] += f":in_range=auto:out_range={rng}"
+        else:
+            vf.append(f"scale=in_range=auto:out_range={rng}")
     if target and target.fps > 0 and abs(info.fps - target.fps) > 0.01:
         vf.append(f"fps={target.fps:.6f}")
     if fade_in > 0:

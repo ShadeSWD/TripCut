@@ -71,6 +71,14 @@ class Settings:
         self.q.setValue("smart_cut", v)
 
     @property
+    def hw_accel(self) -> bool:
+        return self.q.value("hw_accel", True, bool)
+
+    @hw_accel.setter
+    def hw_accel(self, v):
+        self.q.setValue("hw_accel", bool(v))
+
+    @property
     def transition(self) -> float:
         """Длительность затемнения на стыках, сек. 0 — переходы выключены."""
         return self.q.value("transition", 0.0, float)
@@ -138,6 +146,12 @@ class SettingsDialog(QDialog):
         hint.setStyleSheet("color:#888;")
         form.addRow(hint)
 
+        self.hw_cb = QCheckBox("Аппаратное ускорение (Intel QSV / NVENC), если работает")
+        self.hw_cb.setChecked(st.hw_accel)
+        self.hw_cb.setToolTip("Ускоряет перекодирование в разы. Пригодность проверяется\n"
+                              "пробным кодированием, иначе — программный кодировщик.")
+        form.addRow("Кодировщик:", self.hw_cb)
+
         self.geo_mode = QComboBox()
         for key, label in [("auto", "Авто (GPS камеры → трек → ручная точка)"),
                            ("camera", "Только GPS камеры (GoPro)"),
@@ -173,6 +187,7 @@ class SettingsDialog(QDialog):
         self.st.photo_fmt = "png" if self.png_cb.isChecked() else "jpeg"
         self.st.smart_cut = self.smart_cb.isChecked()
         self.st.transition = self.tr_spin.value() if self.tr_cb.isChecked() else 0.0
+        self.st.hw_accel = self.hw_cb.isChecked()
         lat = lon = None
         raw = self.lat_edit.text().replace(";", ",").strip()
         if "," in raw and not self.lon_edit.text().strip():
@@ -900,6 +915,7 @@ class MainWindow(QMainWindow):
             return
         smart = self.st.smart_cut
         transition = self.st.transition
+        ft.HW_ACCEL = self.st.hw_accel
         dlg = QProgressDialog("Компиляция…", None, 0, 100, self)
         dlg.setWindowTitle("TripCut")
         dlg.setWindowModality(Qt.WindowModal)
@@ -926,7 +942,8 @@ class MainWindow(QMainWindow):
                     f"Готово!\n{out}\n\n"
                     f"Режим: {'точный (smart)' if smart else 'по ключевым кадрам'}\n"
                     f"Формат: {target}\n"
-                    f"Переходы: {f'затемнение {transition:g} с' if transition else 'нет'}")
+                    f"Переходы: {f'затемнение {transition:g} с' if transition else 'нет'}\n"
+                    f"Кодировщик: {ft.used_encoder(target)}")
 
         note.done.connect(on_note)
 

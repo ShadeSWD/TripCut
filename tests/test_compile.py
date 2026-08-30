@@ -18,7 +18,7 @@ TMP = os.path.join(tempfile.gettempdir(), "tripcut_test_compile")
 os.makedirs(TMP, exist_ok=True)
 
 
-def make(name, *, w, h, fps, sec, ar, color="red", codec="libx264"):
+def make(name, *, w, h, fps, sec, ar, pix_fmt="yuv420p", codec="libx264"):
     """Тестовый ролик: движущаяся полоса, чтобы кадры отличались друг от друга."""
     path = os.path.join(TMP, name)
     if os.path.exists(path):
@@ -28,7 +28,7 @@ def make(name, *, w, h, fps, sec, ar, color="red", codec="libx264"):
         "-f", "lavfi", "-i", f"testsrc2=size={w}x{h}:rate={fps}:duration={sec}",
         "-f", "lavfi", "-i", f"sine=frequency=440:duration={sec}:sample_rate={ar}",
         "-c:v", codec, "-g", str(int(round(float(fps)))), "-keyint_min",
-        str(int(round(float(fps)))), "-crf", "28", "-pix_fmt", "yuv420p",
+        str(int(round(float(fps)))), "-crf", "28", "-pix_fmt", pix_fmt,
         "-c:a", "aac", "-ar", str(ar), "-ac", "2", "-shortest", path], check=True)
     return path
 
